@@ -76,6 +76,11 @@ dependencies {
 
     implementation(libs.coil.compose)
 
+    // Persistencia local (Room sobre SQLite): caché de la biblioteca de ejercicios.
+    implementation(libs.room.runtime)
+    implementation(libs.room.ktx)
+    ksp(libs.room.compiler)
+
     coreLibraryDesugaring(libs.desugar.jdk.libs)
 
     testImplementation(libs.junit)

@@ -3,6 +3,8 @@ package com.esan.sportpro.data.entrenamientos
 import android.net.Uri
 import com.esan.sportpro.data.esperarConfirmacion
 import com.esan.sportpro.data.imagenes.CompresorImagen
+import com.esan.sportpro.data.local.EjercicioDao
+import com.esan.sportpro.data.local.EjercicioEntity
 import com.esan.sportpro.domain.entrenamientos.EjercicioBiblioteca
 import com.esan.sportpro.domain.entrenamientos.Entrenamiento
 import com.esan.sportpro.domain.entrenamientos.EntrenamientoRepository
@@ -22,7 +24,15 @@ import com.google.firebase.firestore.toObject
 import com.google.firebase.storage.FirebaseStorage
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withTimeoutOrNull
 import java.time.ZoneId
@@ -39,6 +49,7 @@ class FirestoreEntrenamientoRepository @Inject constructor(
     private val firestore: FirebaseFirestore,
     private val storage: FirebaseStorage,
     private val compresor: CompresorImagen,
+    private val ejercicioDao: EjercicioDao,
 ) : EntrenamientoRepository {
 
     private val entrenamientos get() = firestore.collection("entrenamientos")
@@ -199,7 +210,37 @@ class FirestoreEntrenamientoRepository @Inject constructor(
     private fun historial(entrenamientoId: String) =
         entrenamientos.document(entrenamientoId).collection("historial_asistencia")
 
-    override fun observarBiblioteca(academiaId: String): Flow<List<EjercicioBiblioteca>> = callbackFlow {
+    /**
+     * La pantalla lee de la tabla Room `ejercicios_biblioteca`; mientras se observa, los cambios de
+     * Firestore se copian a esa tabla. Sin conexión se muestra lo último guardado en el teléfono.
+     */
+    override fun observarBiblioteca(academiaId: String): Flow<List<EjercicioBiblioteca>> = channelFlow {
+        // Evita mostrar "biblioteca vacía" antes de la primera respuesta de Firestore cuando la
+        // tabla local todavía no tiene nada de esta academia.
+        val sincronizado = MutableStateFlow(false)
+        launch {
+            snapshotsBiblioteca(academiaId)
+                .catch { error ->
+                    // Si ya hay copia local se sigue mostrando; si no, se informa el error.
+                    if (ejercicioDao.contar(academiaId) == 0) close(error)
+                }
+                .collect { (lista, desdeCache) ->
+                    // Una caché de Firestore vacía (primer arranque sin red) no debe borrar la copia local.
+                    if (!(desdeCache && lista.isEmpty())) {
+                        ejercicioDao.reemplazarAcademia(academiaId, lista.map(EjercicioEntity::desde))
+                    }
+                    sincronizado.value = true
+                }
+        }
+        combine(ejercicioDao.observarPorAcademia(academiaId), sincronizado) { filas, listo -> filas to listo }
+            .filter { (filas, listo) -> filas.isNotEmpty() || listo }
+            .map { (filas, _) -> filas.map { it.aDominio() } }
+            .distinctUntilChanged()
+            .collect { send(it) }
+    }
+
+    /** Documentos de la biblioteca en Firestore y si el snapshot vino solo de su caché. */
+    private fun snapshotsBiblioteca(academiaId: String): Flow<Pair<List<EjercicioBiblioteca>, Boolean>> = callbackFlow {
         val registro = biblioteca.whereEqualTo("academiaId", academiaId)
             .addSnapshotListener { snapshot, error ->
                 if (error != null) {
@@ -207,8 +248,7 @@ class FirestoreEntrenamientoRepository @Inject constructor(
                     return@addSnapshotListener
                 }
                 val lista = snapshot?.documents?.mapNotNull { it.toObject<EjercicioBiblioteca>() }.orEmpty()
-                    .sortedBy { it.nombre.lowercase() }
-                trySend(lista)
+                trySend(lista to (snapshot?.metadata?.isFromCache == true))
             }
         awaitClose { registro.remove() }
     }
@@ -252,14 +292,32 @@ class FirestoreEntrenamientoRepository @Inject constructor(
         } else {
             documento.update(datos).esperarConfirmacion()
         }
+        // Copia local inmediata, también cuando la escritura quedó pendiente por falta de red.
+        ejercicioDao.guardar(
+            EjercicioEntity.desde(
+                ejercicio.copy(
+                    id = documento.id,
+                    nombre = ejercicio.nombre.trim(),
+                    objetivo = ejercicio.objetivo.trim(),
+                    materiales = ejercicio.materiales.trim(),
+                    descripcion = ejercicio.descripcion.trim(),
+                    imagenUrl = imagenUrl,
+                    activo = if (nuevo) true else ejercicio.activo,
+                ),
+            ),
+        )
         return ResultadoGuardarEjercicio(confirmado = confirmado, imagenFallida = imagenFallida)
     }
 
-    override suspend fun cambiarEstadoEjercicio(ejercicioId: String, activo: Boolean): Boolean =
-        biblioteca.document(ejercicioId).update("activo", activo).esperarConfirmacion()
+    override suspend fun cambiarEstadoEjercicio(ejercicioId: String, activo: Boolean): Boolean {
+        val confirmado = biblioteca.document(ejercicioId).update("activo", activo).esperarConfirmacion()
+        ejercicioDao.cambiarEstado(ejercicioId, activo)
+        return confirmado
+    }
 
     override suspend fun eliminarEjercicio(ejercicio: EjercicioBiblioteca): Boolean {
         val confirmado = biblioteca.document(ejercicio.id).delete().esperarConfirmacion()
+        ejercicioDao.eliminar(ejercicio.id)
         if (ejercicio.imagenUrl.isNotBlank()) runCatching { imagenEjercicio(ejercicio.id).delete() }
         return confirmado
     }

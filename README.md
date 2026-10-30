@@ -7,6 +7,7 @@ SportPro - App móvil de gestión de academias deportivas (Desarrollo de Aplicac
 - Kotlin + Jetpack Compose (Material 3)
 - Arquitectura MVVM: `ViewModel` + `StateFlow` + Navigation Compose
 - Firebase: Authentication, Cloud Firestore (persistencia offline habilitada), Cloud Storage, Cloud Messaging
+- Persistencia local con Room (SQLite): caché de la biblioteca de ejercicios
 - Inyección de dependencias con Hilt
 
 ## Requisitos
@@ -35,7 +36,8 @@ que te agregue en **Configuración del proyecto → Usuarios y permisos**.
 ```
 app/src/main/java/com/esan/sportpro/
 ├── core/            # theme, ViewModel base, utilidades compartidas
-├── di/              # módulos Hilt (Firebase, etc.)
+├── di/              # módulos Hilt (Firebase, Room, etc.)
+├── data/local/       # base de datos Room (SQLite): entidades y DAO
 ├── navigation/       # rutas y NavHost raíz
 ├── messaging/        # FirebaseMessagingService
 ├── data/<modulo>/     # DTOs, fuentes remotas (Firestore/Storage), repos
@@ -48,6 +50,42 @@ Módulos (`<modulo>`): `cuentas`, `academia`, `jugadores`, `entrenamientos`, `pa
 módulo en `data/`, `domain/` y `ui/`; los únicos archivos compartidos que pueden generar
 conflicto son `navigation/SportProNavHost.kt`, `navigation/NavRoutes.kt` y los módulos en
 `di/` — al tocarlos, agrega solo tu propia entrada y avisa en el PR.
+
+## Persistencia local (Room & SQLite)
+
+La biblioteca de ejercicios (US-009) guarda una copia local en SQLite usando Room, para que el
+entrenador pueda ver y buscar ejercicios sin conexión.
+
+| Archivo | Rol |
+|---|---|
+| `data/local/EjercicioEntity.kt` | `@Entity` de la tabla `ejercicios_biblioteca` y conversión a `EjercicioBiblioteca` |
+| `data/local/EjercicioDao.kt` | `@Dao` con las consultas SQL (observar por academia, upsert, activar/desactivar, eliminar, reemplazar en una transacción) |
+| `data/local/SportProDatabase.kt` | `@Database` `sportpro.db`, versión 1 |
+| `di/DatabaseModule.kt` | Provee la base y el DAO con Hilt |
+| `data/entrenamientos/FirestoreEntrenamientoRepository.kt` | Sincroniza Firestore → Room y escribe en ambos |
+
+**Flujo de datos**
+
+1. La pantalla observa `EntrenamientoRepository.observarBiblioteca()`, que lee de Room como `Flow`.
+2. Mientras se observa, un listener de Firestore copia los documentos de `ejercicios` a la tabla
+   (`reemplazarAcademia`, en una sola transacción). Room vuelve a emitir y la UI se actualiza.
+3. Crear, editar, activar/desactivar o eliminar un ejercicio escribe en Firestore y en Room al
+   mismo tiempo, así que el cambio se ve al instante aunque no haya red. Firestore lo envía al
+   servidor cuando vuelve la conexión.
+4. Sin conexión se muestran los datos guardados en el teléfono. Una caché vacía de Firestore no
+   borra la copia local, y el error solo se muestra si no hay nada guardado.
+
+Como la tabla es una copia de Firestore, un cambio de esquema sin migración recrea la base
+(`fallbackToDestructiveMigration`) y se vuelve a llenar en la siguiente sincronización.
+
+**Cómo probarlo**
+
+1. Abre la Biblioteca de ejercicios con internet.
+2. Activa el modo avión, cierra la app y vuelve a abrirla: los ejercicios siguen apareciendo.
+3. En Android Studio, **App Inspection → Database Inspector** muestra la tabla
+   `ejercicios_biblioteca` dentro de `sportpro.db`.
+4. Prueba unitaria: `app/src/test/java/com/esan/sportpro/data/EjercicioEntityTest.kt`
+   (`./gradlew testDebugUnitTest`).
 
 ## Convención de ramas
 
